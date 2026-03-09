@@ -21,8 +21,9 @@ setup(
         'console_scripts': [
             'hand_controller = agv_pc.hand_controller:main',
             'motion_manager  = agv_pc.motion_manager:main',
-            'udp_sender     = agv_pc.udp_sender:main',
+            'udp_gateway     = agv_pc.udp_gateway:main',
             'dashboard_ui   = agv_pc.dashboard_ui:main',
+            'lidar_guard    = agv_pc.lidar_guard:main',
         ],
     },
 )
