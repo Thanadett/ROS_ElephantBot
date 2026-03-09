@@ -1,0 +1,11 @@
+# Request: toggle human control override
+bool  enable_override         # true = block human commands, system takes control
+string requester              # who is requesting (e.g. "lidar_guard", "operator")
+float32 direct_linear_x      # direct motion command when override=true (0 = stop)
+float32 direct_linear_y
+float32 direct_angular_z
+---
+# Response
+bool    success
+string  message
+bool    override_active       # current override state after this call
