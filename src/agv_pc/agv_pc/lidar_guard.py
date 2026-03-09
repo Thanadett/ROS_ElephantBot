@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """
-lidar_guard.py — 660610822 Final Project
-Runs on PC (ROS2 Jazzy, ROS_DOMAIN_ID=1)
+lidar_guard_pro.py
+Advanced safety controller for AGV (ROS2 Jazzy)
 
-Flow:
-  motion_manager → /cmd_vel_command
-  lidar_guard    → /cmd_vel_safe
-  udp_gateway    → UDP → Robot
-
-การคำนวณระยะ:
-  - แปลงจุด LiDAR → frame หุ่น (รวม lidar_offset)
-  - คำนวณ effective_dist = ระยะจากกึ่งกลาง - ระยะถึงขอบหุ่น
-  - P-controller ผลักออกเมื่อ effective_dist < target_dist (120mm)
-  - Low-pass filter ทำให้การเคลื่อนที่นุ่มนวล
+Features
+--------
+• Predictive braking (velocity based stopping distance)
+• Velocity adaptive safety zones
+• Repulsive obstacle vector field
+• Anti oscillation (zone hysteresis)
+• 40Hz safety loop
+• Side corridor centering
 """
 
 import math
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
@@ -27,221 +25,329 @@ from agv_interfaces.msg import ObstacleAlert
 from agv_interfaces.msg import ObstacleInfo
 
 
-# ══ Thresholds ══════════════════════════════════════════════════
-TARGET_DIST    = 0.120   # 120mm: ระยะรักษา (error=0 → หยุดผลัก)
-ALERT_DIST     = 0.150   # 150mm: เริ่มแจ้งเตือน WARNING
-STOP_THRESHOLD = 0.050   # 50mm:  ฉุกเฉิน PINCH stop
+# ═══════════════════════════════════════════════════════
+# Robot parameters
+# ═══════════════════════════════════════════════════════
 
-KP             = 0.5     # P-Gain avoidance
-ALPHA          = 0.6     # Low-pass filter coefficient
-AVOID_LIMIT    = 0.115   # m/s สูงสุดของ avoidance velocity
-PUBLISH_HZ     = 20
+HALF_LENGTH = 0.311 / 2
+HALF_WIDTH  = 0.190 / 2
 
-# ══ Robot Body (myAGV Pro) ══════════════════════════════════════
-HALF_LENGTH    = 0.311 / 2   # ครึ่งความยาวหุ่น (m)
-HALF_WIDTH     = 0.190 / 2   # ครึ่งความกว้างหุ่น (m)
-LIDAR_OFFSET_X = 0.070       # LiDAR อยู่ข้างหน้ากึ่งกลาง 70mm
-LIDAR_OFFSET_Y = 0.000
-SELF_FILTER    = 0.018       # ละเว้นจุดที่ effective_dist < 18mm (ตัวหุ่นเอง)
+LIDAR_OFFSET_X = 0.070
+LIDAR_OFFSET_Y = 0.0
+
+SELF_FILTER = 0.018
 
 
-class LidarGuard(Node):
+# ═══════════════════════════════════════════════════════
+# Safety parameters
+# ═══════════════════════════════════════════════════════
+
+CLEAR_DIST     = 0.20
+TARGET_DIST    = 0.15
+EMERGENCY_DIST = 0.10
+
+KP_FIELD = 0.8
+
+MAX_DECEL = 0.8
+SAFE_MARGIN = 0.05
+
+ZONE_HYST = 0.02
+
+AVOID_LIMIT = 0.12
+MAX_SAFE_SPEED = 0.50
+
+ALPHA = 0.6
+
+CONTROL_HZ = 40
+
+
+class LidarGuardPro(Node):
 
     def __init__(self):
-        super().__init__('lidar_guard')
 
-        qos_scan = QoSProfile(depth=5,  reliability=ReliabilityPolicy.BEST_EFFORT)
+        super().__init__('lidar_guard_pro')
+
+        qos_scan = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         qos_rel  = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
-        # ── Subscribers ──────────────────────────────────────────
-        self.create_subscription(LaserScan, '/scan',           self._scan_cb, qos_scan)
-        self.create_subscription(Twist,     '/cmd_vel_command',self._cmd_cb,  qos_rel)
+        self.create_subscription(
+            LaserScan, '/scan', self.scan_cb, qos_scan)
 
-        # ── Publishers ───────────────────────────────────────────
-        self.cmd_pub   = self.create_publisher(Twist,         '/cmd_vel_safe',   qos_rel)
-        self.alert_pub = self.create_publisher(ObstacleAlert, '/obstacle_alert', qos_rel)
-        self.info_pub  = self.create_publisher(ObstacleInfo,  '/obstacle_info',  qos_rel)
+        self.create_subscription(
+            Twist, '/cmd_vel_command', self.cmd_cb, qos_rel)
 
-        # ── State ────────────────────────────────────────────────
-        self.current_cmd  = Twist()
-        self.latest_scan  = None
-        self.smooth_vx    = 0.0
-        self.smooth_vy    = 0.0
-        self.avoid_active = False
+        self.cmd_pub = self.create_publisher(
+            Twist, '/cmd_vel_safe', qos_rel)
 
-        self.create_timer(1.0 / PUBLISH_HZ, self._publish_loop)
+        self.alert_pub = self.create_publisher(
+            ObstacleAlert, '/obstacle_alert', qos_rel)
 
-        self.get_logger().info("══ Lidar Guard (660610822) ══")
-        self.get_logger().info("   ← /scan  ← /cmd_vel_command")
-        self.get_logger().info("   → /cmd_vel_safe  → /obstacle_alert  → /obstacle_info")
+        self.info_pub = self.create_publisher(
+            ObstacleInfo, '/obstacle_info', qos_rel)
 
-    # ── Callbacks ────────────────────────────────────────────────
-    def _scan_cb(self, msg): self.latest_scan = msg
-    def _cmd_cb(self, msg):  self.current_cmd = msg
+        self.latest_scan = None
+        self.current_cmd = Twist()
 
-    # ── Main loop ─────────────────────────────────────────────────
-    def _publish_loop(self):
+        self.smooth_vx = 0.0
+        self.smooth_vy = 0.0
+
+        self.last_zone = "CLEAR"
+
+        self.create_timer(1.0 / CONTROL_HZ, self.control_loop)
+
+        self.get_logger().info("════ LIDAR GUARD PRO ════")
+        self.get_logger().info("Control loop: 40Hz")
+        self.get_logger().info("Predictive braking enabled")
+        self.get_logger().info("Vector field avoidance enabled")
+
+
+    def scan_cb(self, msg):
+        self.latest_scan = msg
+
+
+    def cmd_cb(self, msg):
+        self.current_cmd = msg
+
+
+    def control_loop(self):
+
         if self.latest_scan is None:
             self.cmd_pub.publish(self.current_cmd)
             return
 
         scan = self.latest_scan
+
         raw_vx = 0.0
         raw_vy = 0.0
 
-        left_min  = float('inf')   # ~90°  ด้านซ้าย
-        right_min = float('inf')   # ~270° ด้านขวา
-        min_eff   = float('inf')   # obstacle ที่ใกล้สุด
-        min_angle_body_deg = 0.0   # มุมของ obstacle นั้นในระบบ body frame (CW จากหน้า)
+        left_min = float('inf')
+        right_min = float('inf')
 
-        for i, raw_dist in enumerate(scan.ranges):
+        min_eff = float('inf')
+        min_angle = 0.0
 
-            if not math.isfinite(raw_dist) or raw_dist <= 0.05:
+
+        for i, dist in enumerate(scan.ranges):
+
+            if not math.isfinite(dist) or dist < 0.05:
                 continue
 
-            # ── แปลงจุดเป็น body frame ─────────────────────────
-            angle_lidar = scan.angle_min + i * scan.angle_increment
-            lx = raw_dist * math.cos(angle_lidar)
-            ly = raw_dist * math.sin(angle_lidar)
+            angle = scan.angle_min + i * scan.angle_increment
 
-            bx = lx + LIDAR_OFFSET_X   # body frame (x=หน้า, y=ซ้าย)
+            lx = dist * math.cos(angle)
+            ly = dist * math.sin(angle)
+
+            bx = lx + LIDAR_OFFSET_X
             by = ly + LIDAR_OFFSET_Y
 
-            dist_center   = math.sqrt(bx**2 + by**2)
-            angle_body    = math.atan2(by, bx)     # rad, CCW จากหน้า
+            d = math.sqrt(bx*bx + by*by)
 
-            # ── คำนวณระยะถึงขอบหุ่น ────────────────────────────
-            cos_a = abs(math.cos(angle_body))
-            sin_a = abs(math.sin(angle_body))
-            dist_to_edge = min(HALF_LENGTH / max(cos_a, 1e-6),
-                               HALF_WIDTH  / max(sin_a, 1e-6))
+            ang = math.atan2(by, bx)
 
-            effective_dist = dist_center - dist_to_edge
+            cos_a = abs(math.cos(ang))
+            sin_a = abs(math.sin(ang))
 
-            if effective_dist < SELF_FILTER:
-                continue   # จุดของตัวหุ่นเอง ละเว้น
+            edge = min(
+                HALF_LENGTH / max(cos_a, 1e-6),
+                HALF_WIDTH  / max(sin_a, 1e-6)
+            )
 
-            # ── มุมในระบบ CW จากหน้า (สำหรับ dashboard) ────────
-            deg_body     = (math.degrees(angle_body)  + 360) % 360   # CCW
-            deg_body_cw  = (-math.degrees(angle_body) + 360) % 360   # CW จากหน้า
+            eff = d - edge
 
-            # ── track obstacle ใกล้สุด ──────────────────────────
-            if effective_dist < min_eff:
-                min_eff          = effective_dist
-                min_angle_body_deg = deg_body_cw
+            if eff < SELF_FILTER:
+                continue
 
-            # ── เก็บค่าด้านซ้าย/ขวา (80–100°, 260–280°) ────────
-            if 80.0 <= deg_body <= 100.0:
-                left_min  = min(left_min,  effective_dist)
-            elif 260.0 <= deg_body <= 280.0:
-                right_min = min(right_min, effective_dist)
+            deg = (math.degrees(ang) + 360) % 360
 
-            # ── P-controller: ผลักเมื่อใกล้กว่า 120mm ───────────
-            if effective_dist < TARGET_DIST:
-                error  = TARGET_DIST - effective_dist
-                raw_vx -= math.cos(angle_body) * error * KP
-                raw_vy -= math.sin(angle_body) * error * KP
+            if eff < min_eff:
+                min_eff = eff
+                min_angle = deg
 
-        # ── Side centering logic ─────────────────────────────────
-        side_vy       = 0.0
-        in_side_ctrl  = False
+            if 80 <= deg <= 100:
+                left_min = min(left_min, eff)
+
+            elif 260 <= deg <= 280:
+                right_min = min(right_min, eff)
+
+            # repulsive vector field
+
+            if eff < TARGET_DIST:
+
+                d = max(eff, 0.02)
+
+                rep = KP_FIELD * (1.0/d - 1.0/TARGET_DIST)
+
+                raw_vx -= math.cos(ang) * rep
+                raw_vy -= math.sin(ang) * rep
+
+
+        # side centering
 
         if left_min < TARGET_DIST or right_min < TARGET_DIST:
-            in_side_ctrl = True
-            l_val = left_min  if left_min  < TARGET_DIST else TARGET_DIST
-            r_val = right_min if right_min < TARGET_DIST else TARGET_DIST
-            side_vy = (l_val - r_val) * KP
-            raw_vx  = 0.0   # ล็อก X เมื่ออยู่ใน side control
 
-        target_vx = 0.0    if in_side_ctrl else raw_vx
-        target_vy = side_vy if in_side_ctrl else raw_vy
+            l = left_min if left_min < TARGET_DIST else TARGET_DIST
+            r = right_min if right_min < TARGET_DIST else TARGET_DIST
 
-        # ── Low-pass filter ──────────────────────────────────────
-        self.smooth_vx = ALPHA * target_vx + (1.0 - ALPHA) * self.smooth_vx
-        self.smooth_vy = ALPHA * target_vy + (1.0 - ALPHA) * self.smooth_vy
+            raw_vy = (l - r) * 0.8
+            raw_vx = 0.0
 
-        # dead-band: ถ้าใกล้ถึง 120mm แล้ว ส่ง 0 เลย
-        if abs(self.smooth_vx) < 0.005: self.smooth_vx = 0.0
-        if abs(self.smooth_vy) < 0.005: self.smooth_vy = 0.0
 
-        # ── Determine zone ───────────────────────────────────────
-        if min_eff < TARGET_DIST:
+        # smoothing
+
+        self.smooth_vx = ALPHA * raw_vx + (1-ALPHA) * self.smooth_vx
+        self.smooth_vy = ALPHA * raw_vy + (1-ALPHA) * self.smooth_vy
+
+
+        # predictive braking
+
+        v = abs(self.current_cmd.linear.x)
+
+        stop_dist = (v*v) / (2*MAX_DECEL)
+
+        dynamic_emergency = max(EMERGENCY_DIST, stop_dist + SAFE_MARGIN)
+
+        dynamic_target = max(TARGET_DIST, stop_dist * 1.4)
+
+        dynamic_clear = max(CLEAR_DIST, stop_dist * 2.0)
+
+
+        # zone detection
+
+        if min_eff < dynamic_emergency:
+            zone = "EMERGENCY"
+
+        elif min_eff < dynamic_target - ZONE_HYST:
             zone = "CRITICAL"
-        elif min_eff < ALERT_DIST:
+
+        elif min_eff < dynamic_clear - ZONE_HYST:
             zone = "WARNING"
+
         else:
             zone = "CLEAR"
 
-        # ── Publish obstacle info ────────────────────────────────
-        if zone != "CLEAR":
-            self._publish_obstacle(min_eff, min_angle_body_deg, zone)
 
-        # ── Emergency PINCH stop ─────────────────────────────────
-        if left_min < STOP_THRESHOLD and right_min < STOP_THRESHOLD:
-            self.get_logger().warn("PINCHED! Emergency Stop.")
-            self.cmd_pub.publish(Twist())   # zero
-            self.smooth_vx = 0.0
-            self.smooth_vy = 0.0
+        # log zone changes
+
+        if zone != self.last_zone:
+
+            dist_mm = min_eff * 1000
+
+            if zone == "CLEAR":
+                self.get_logger().info("CLEAR path")
+
+            elif zone == "WARNING":
+                self.get_logger().warn(
+                    f"WARNING {dist_mm:.0f}mm")
+
+            elif zone == "CRITICAL":
+                self.get_logger().warn(
+                    f"CRITICAL {dist_mm:.0f}mm")
+
+            elif zone == "EMERGENCY":
+                self.get_logger().error(
+                    f"EMERGENCY {dist_mm:.0f}mm")
+
+            self.last_zone = zone
+
+
+        # publish obstacle
+
+        if zone != "CLEAR":
+            self.publish_obstacle(min_eff, min_angle, zone)
+
+
+        # actions
+
+        if zone == "EMERGENCY":
+
+            self.cmd_pub.publish(Twist())
             return
 
-        # ── Publish /cmd_vel_safe ────────────────────────────────
+
         if zone == "CRITICAL":
-            if not self.avoid_active:
-                self.get_logger().warn(f"CRITICAL {min_eff*1000:.0f}mm @ {min_angle_body_deg:.0f}°")
-            self.avoid_active = True
 
             cmd = Twist()
+
             cmd.linear.x = max(min(self.smooth_vx, AVOID_LIMIT), -AVOID_LIMIT)
             cmd.linear.y = max(min(self.smooth_vy, AVOID_LIMIT), -AVOID_LIMIT)
+
             self.cmd_pub.publish(cmd)
+            return
 
-        else:
-            if self.avoid_active:
-                self.get_logger().info("Path clear — resuming")
-            self.avoid_active = False
-            self.smooth_vx = 0.0
-            self.smooth_vy = 0.0
-            self.cmd_pub.publish(self.current_cmd)
 
-    # ── Obstacle publishers ───────────────────────────────────────
-    def _publish_obstacle(self, dist_m, angle_cw_deg, zone):
+        if zone == "WARNING":
+
+            span = dynamic_clear - dynamic_target
+
+            scale = (min_eff - dynamic_target) / span
+            scale = max(0.0, min(1.0, scale))
+
+            scale = scale * scale
+
+            cmd = Twist()
+
+            cmd.linear.x = self.current_cmd.linear.x * scale
+            cmd.linear.y = self.current_cmd.linear.y * scale
+            cmd.angular.z = self.current_cmd.angular.z * scale
+
+            cmd.linear.x = max(min(cmd.linear.x, 0.08), -0.08)
+
+            self.cmd_pub.publish(cmd)
+            return
+
+
+        cmd = self.current_cmd
+
+        cmd.linear.x = max(min(cmd.linear.x, MAX_SAFE_SPEED), -MAX_SAFE_SPEED)
+
+        self.cmd_pub.publish(cmd)
+
+
+    def publish_obstacle(self, dist, angle, zone):
+
         now = self.get_clock().now().to_msg()
 
         alert = ObstacleAlert()
-        alert.header.stamp    = now
-        alert.header.frame_id = 'base_link'
+
+        alert.header.stamp = now
+        alert.header.frame_id = "base_link"
+
         alert.obstacle_present = True
-        alert.angle_deg   = angle_cw_deg
-        alert.distance_mm = dist_m * 1000.0
-        alert.zone        = zone
-        if zone == "CRITICAL":
-            # คำนวณ avoidance vector สำหรับ log
-            angle_rad = math.radians((360.0 - angle_cw_deg) % 360.0)  # CW → CCW rad
-            alert.avoid_linear_x = -math.cos(angle_rad) * AVOID_LIMIT
-            alert.avoid_linear_y = -math.sin(angle_rad) * AVOID_LIMIT
+        alert.angle_deg = angle
+        alert.distance_mm = dist * 1000
+        alert.zone = zone
+
         self.alert_pub.publish(alert)
 
+
         info = ObstacleInfo()
+
         info.header.stamp = now
-        info.distance  = alert.distance_mm
-        info.angle     = alert.angle_deg
-        info.warning   = True
-        info.emergency = (zone == "CRITICAL")
+        info.distance = dist * 1000
+        info.angle = angle
+        info.warning = True
+        info.emergency = zone in ("CRITICAL", "EMERGENCY")
+
         self.info_pub.publish(info)
 
 
 def main(args=None):
+
     rclpy.init(args=args)
-    node = LidarGuard()
+
+    node = LidarGuardPro()
+
     try:
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
+
     finally:
         node.cmd_pub.publish(Twist())
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-Gesture mapping (Right hand):
-  Middle finger down   → Forward
-  Pinky finger down    → Backward
-  Index finger down    → Turn Left
-  Ring finger down     → Turn Right
-  Fist                 → Rotate CW
-
-Gesture mapping (Left hand):
-  Fist                 → Rotate CCW
-  Index finger down    → Strafe Right
-  Pinky finger down    → Strafe Left
-  Middle+Ring hold 1s  → Speed Control mode (slide up/down)
-
-Both open palms → STOP | No hands → Idle
-"""
 
 import os, sys, math, time, urllib.request
 import cv2
@@ -27,6 +11,7 @@ from mediapipe.tasks.python.vision import HandLandmarksConnections
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from agv_interfaces.msg import ObstacleAlert
 
 # ══════════════════════════════════════════════════════════════════
 #  Model auto-download
