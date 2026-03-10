@@ -1,19 +1,3 @@
-"""
-pc.launch.py  — 660610822 Final Project
-Launch PC-side nodes  (ROS2 Jazzy, ROS_DOMAIN_ID=1)
-
-รัน:
-    export ROS_DOMAIN_ID=1
-    ros2 launch agv_bringup pc.launch.py robot_ip:=192.168.1.100
-
-Flow:
-  hand_controller → /hand/cmd_vel
-  motion_manager  → /cmd_vel_command
-  lidar_guard     ← /scan (จาก udp_gateway) + /cmd_vel_command → /cmd_vel_safe + /obstacle_info
-  udp_gateway     ← /cmd_vel_safe → UDP:15000→Robot  |  Robot UDP:15001 → /scan
-  dashboard_ui    ← /camera_image/compressed + /hand_control_state + /obstacle_info
-"""
-
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
@@ -69,11 +53,6 @@ def generate_launch_description():
         }]
     )
 
-    dashboard_node = Node(
-        package='agv_pc', executable='dashboard_ui',
-        name='ui_node', output='screen',
-    )
-
     return LaunchDescription([
         LogInfo(msg="═══ 660610822 AGV — PC Nodes (Jazzy, DOMAIN_ID=1) ═══"),
         LogInfo(msg="hand_controller | motion_manager | lidar_guard | udp_gateway | dashboard_ui"),
@@ -82,5 +61,4 @@ def generate_launch_description():
         motion_manager_node,
         lidar_guard_node,
         udp_gateway_node,
-        dashboard_node,
     ])

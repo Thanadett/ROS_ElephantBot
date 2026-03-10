@@ -1,10 +1,3 @@
-"""
-robot.launch.py  — 660610822 Final Project
-Launch robot-side nodes  (ROS2 Galactic, ROS_DOMAIN_ID=0)
-
-รัน: export ROS_DOMAIN_ID=0 && ros2 launch agv_bringup robot.launch.py
-"""
-
 from launch import LaunchDescription
 from launch.actions import LogInfo
 from launch_ros.actions import Node

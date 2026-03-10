@@ -128,7 +128,6 @@ class LidarGuardPro(Node):
 
 
         for i, dist in enumerate(scan.ranges):
-
             if not math.isfinite(dist) or dist < 0.05:
                 continue
 
